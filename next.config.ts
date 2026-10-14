@@ -25,6 +25,8 @@ const r2RemotePattern = (() => {
 
 const nextConfig: NextConfig = {
   trailingSlash: false,
+  poweredByHeader: false,
+  compress: true,
 
   compiler: {
     removeConsole: !isDevelopment,
@@ -88,6 +90,15 @@ const nextConfig: NextConfig = {
 
   async headers() {
     return [
+      {
+        source: '/imagens/:path*',
+        headers: [
+          {
+            key: 'Cache-Control',
+            value: 'public, max-age=31536000, immutable',
+          },
+        ],
+      },
       {
         source: '/(.*)',
         headers: [
