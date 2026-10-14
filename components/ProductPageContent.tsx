@@ -1,0 +1,607 @@
+'use client';
+
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { supabase } from '@/lib/supabase';
+import { Product, CartItem, ProductVariant } from '@/types';
+import Link from 'next/link';
+import DirectPurchaseModal from '@/components/modals/DirectPurchaseModal';
+import { useToast } from '@/context/ToastContext';
+import { Share2, ShieldCheck, Truck, CreditCard, ChevronDown, ChevronUp } from 'lucide-react';
+import StickyCTA from './StickyCTA';
+import { useCartStore, CartState } from '@/store/useCartStore';
+import { getProxiedImageUrl } from '@/utils/imageUrl';
+import Image from 'next/image';
+import ShippingEstimator from './ShippingEstimator';
+import Breadcrumbs from '@/components/Breadcrumbs';
+import WishlistButton from '@/components/WishlistButton';
+import ImageZoom from '@/components/ImageZoom';
+import RecentlyViewed from '@/components/RecentlyViewed';
+import SavingsBadge from '@/components/SavingsBadge';
+import CartRecoveryBanner from '@/components/home/CartRecoveryBanner';
+import { PaymentMethods } from '@/components/PaymentMethods';
+import { useRecentlyViewedStore } from '@/store/useRecentlyViewedStore';
+import { useAnalytics } from '@/components/AdvancedAnalytics'; 
+import { buildStorageUrl } from '@/lib/site-config';
+
+const BLUR_DATA_URL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+
+const resolveOriginalUrl = (path: string) => {
+    if (!path) return '';
+    if (path.startsWith('http') || path.startsWith('/')) return path;
+    return buildStorageUrl(path);
+};
+
+interface ProductPageContentProps {
+    id: number;
+    initialProduct?: Product | null;
+}
+
+export default function ProductPageContent({ id, initialProduct }: ProductPageContentProps) {
+    const { showToast } = useToast();
+    const addRecentlyViewed = useRecentlyViewedStore(state => state.addView);
+    const { trackProductView, trackAddToCart, trackEvent } = useAnalytics();
+
+    const [product, setProduct] = useState<Product | null>(initialProduct || null);
+    const [relatedProducts, setRelatedProducts] = useState<Product[]>([]);
+    const [categories, setCategories] = useState<any[]>([]);
+    const [loading, setLoading] = useState(!initialProduct);
+    const [selectedVariant, setSelectedVariant] = useState<string>('');
+    const [currentImageIndex, setCurrentImageIndex] = useState(0);
+    const [isDescExpanded, setIsDescExpanded] = useState(false);
+
+    const touchStartX = useRef<number | null>(null);
+    const touchEndX = useRef<number | null>(null);
+
+    const [showPurchaseModal, setShowPurchaseModal] = useState(false);
+    const [paymentMethod, setPaymentMethod] = useState('PIX');
+
+    const setupProductState = useCallback((data: Product) => {
+        const variants = data.variants as unknown as ProductVariant | null;
+        if (variants && variants.opcoes && variants.opcoes.length > 0) {
+            setSelectedVariant(variants.opcoes[0]);
+        }
+    }, []);
+
+    const fetchRelatedProducts = useCallback(async (currentProduct: Product) => {
+        let query = supabase.from('produtos').select('*').neq('id', currentProduct.id).limit(10);
+
+        if (currentProduct.produtos_relacionados_ids && currentProduct.produtos_relacionados_ids.length > 0) {
+            query = supabase.from('produtos').select('*').in('id', currentProduct.produtos_relacionados_ids);
+        } else if (currentProduct.categoria_id) {
+            query = query.eq('categoria_id', currentProduct.categoria_id);
+        }
+
+        const { data } = await query;
+
+        if (data) {
+            if (currentProduct.produtos_relacionados_ids && currentProduct.produtos_relacionados_ids.length > 0) {
+                setRelatedProducts(data);
+            } else {
+                const sorted = data.sort((a, b) => b.id - a.id).slice(0, 4);
+                setRelatedProducts(sorted);
+            }
+        }
+    }, []);
+
+    const fetchProduct = useCallback(async (productId: number) => {
+        setLoading(true);
+        try {
+            const { data, error } = await supabase.from('produtos').select('*').eq('id', productId).single();
+            if (error) throw error;
+            setProduct(data);
+            setupProductState(data);
+            fetchRelatedProducts(data);
+        } catch (error) {
+            console.error('Error fetching product:', error);
+        } finally {
+            setLoading(false);
+        }
+    }, [setupProductState, fetchRelatedProducts]);
+
+    const loadCategories = useCallback(async () => {
+        try {
+            const { data } = await supabase.from('categorias').select('*').order('nome');
+            setCategories(data || []);
+        } catch (error) {
+            console.error('Error loading categories:', error);
+        }
+    }, []);
+
+    useEffect(() => {
+        if (!initialProduct && id) {
+            fetchProduct(id);
+        } else if (initialProduct) {
+            setupProductState(initialProduct);
+            fetchRelatedProducts(initialProduct);
+            setLoading(false);
+            addRecentlyViewed(initialProduct);
+        }
+        loadCategories();
+    }, [id, initialProduct, addRecentlyViewed, fetchProduct, setupProductState, fetchRelatedProducts, loadCategories]);
+
+    useEffect(() => {
+        if (product) {
+            const price = product.preco_promocional || product.preco;
+            trackProductView(
+                String(product.id), 
+                product.nome, 
+                String(product.categoria_id || 'sem-categoria'), 
+                price
+            );
+        }
+    }, [product, trackProductView]);
+
+    const addItem = useCartStore((state: CartState) => state.addItem);
+
+    const getDisplayedPrice = (p: Product, method: string) => {
+        const normalizedMethod = method.toLowerCase();
+        if (normalizedMethod === 'pix' && p.preco_pix && p.preco_pix > 0) {
+            return p.preco_pix;
+        }
+        if (p.preco_promocional && p.preco_promocional < p.preco) {
+            return p.preco_promocional;
+        }
+        return p.preco;
+    };
+
+    const addToCart = () => {
+        if (!product) return;
+
+        const variants = product.variants as unknown as ProductVariant | null;
+        if (variants && !selectedVariant) {
+            showToast(`Por favor, selecione uma opção de ${variants.tipo}`, 'error');
+            return;
+        }
+
+        const price = getDisplayedPrice(product, paymentMethod);
+
+        trackAddToCart(String(product.id), product.nome, 1, price);
+
+        const cartItem: CartItem = {
+            produto_id: product.id,
+            quantidade: 1,
+            variante: variants ? { tipo: variants.tipo, opcao: selectedVariant } : null
+        };
+
+        addItem(cartItem);
+    };
+
+
+
+    const handleShare = async () => {
+        if (!product) return;
+        const url = window.location.href;
+        const title = `${product.nome} | Gringa Style`;
+        const text = `Confira ${product.nome} na Gringa Style!`;
+
+        trackEvent({
+            event: 'share',
+            category: 'engagement',
+            action: 'share',
+            label: product.nome
+        });
+
+        if (navigator.share) {
+            try {
+                await navigator.share({ title, text, url });
+            } catch (error) {
+                console.log('Error sharing:', error);
+            }
+        } else {
+            navigator.clipboard.writeText(url);
+            showToast('Link copiado para a área de transferência!', 'success');
+        }
+    };
+
+    const onTouchStart = (e: React.TouchEvent) => {
+        touchEndX.current = null;
+        touchStartX.current = e.targetTouches[0].clientX;
+    };
+
+    const onTouchMove = (e: React.TouchEvent) => {
+        touchEndX.current = e.targetTouches[0].clientX;
+    };
+
+    const onTouchEnd = () => {
+        if (!touchStartX.current || !touchEndX.current) return;
+        const distance = touchStartX.current - touchEndX.current;
+        const isLeftSwipe = distance > 50;
+        const isRightSwipe = distance < -50;
+
+        const mediaUrls = product?.media_urls || product?.imagens || [];
+        if (mediaUrls.length <= 1) return;
+
+        if (isLeftSwipe) {
+            setCurrentImageIndex((prev) => (prev + 1) % mediaUrls.length);
+        }
+        if (isRightSwipe) {
+            setCurrentImageIndex((prev) => (prev - 1 + mediaUrls.length) % mediaUrls.length);
+        }
+    };
+
+    if (loading) return <div className="container" style={{ padding: '50px 0', textAlign: 'center', color: 'white' }}>Carregando produto...</div>;
+    if (!product) return <div className="container" style={{ padding: '50px 0', textAlign: 'center', color: 'white' }}>Produto não encontrado.</div>;
+
+    const mediaUrls = product.media_urls || product.imagens || [];
+    const currentMedia = mediaUrls[currentImageIndex];
+    const isVideo = currentMedia?.includes('.mp4') || currentMedia?.includes('.webm') || !!product.video;
+    const videoUrl = product.video || (isVideo ? currentMedia : null);
+    const variants = product.variants as unknown as ProductVariant | null;
+    const fallbackImage = '/imagens/logo_gringa_style.png';
+
+    const MAX_DESC_LENGTH = 150;
+    const isLongDescription = product.descricao && product.descricao.length > MAX_DESC_LENGTH;
+
+    const displayedPrice = getDisplayedPrice(product, paymentMethod);
+    const isPromo = displayedPrice < product.preco;
+    const descontoPercentual = isPromo 
+        ? Math.round(((product.preco - displayedPrice) / product.preco) * 100) 
+        : 0;
+
+    return (
+        <div className="container produto-page-container">
+            <CartRecoveryBanner context="product_page" />
+
+            {product && (
+                <Breadcrumbs
+                    items={[
+                        { 
+                            label: product.categoria_id ? categories?.find((c: any) => c.id === product.categoria_id)?.nome || 'Produtos' : 'Produtos', 
+                            href: '/#produtos' 
+                        },
+                        { label: product.nome }
+                    ]}
+                />
+            )}
+
+            <div className="titulo-mobile-container" style={{ display: 'none', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '15px', marginTop: '20px' }}>
+                <span role="heading" aria-level={1} style={{ fontFamily: 'var(--fonte-titulos)', fontSize: '2rem', lineHeight: '1.1', color: 'var(--cor-destaque)', margin: 0, fontWeight: 'bold', display: 'block' }}>{product?.nome}</span>
+                <button onClick={handleShare} className="btn-share" aria-label="Compartilhar" style={{ background: 'none', border: 'none', color: '#ccc', cursor: 'pointer', padding: '0 0 0 10px' }}>
+                    <Share2 size={24} />
+                </button>
+            </div>
+
+            <div className="detalhe-produto-container">
+                <div className="produto-detalhe-coluna-img" style={{ display: 'flex', flexDirection: 'column' }}>
+                    <div
+                        style={{ position: 'relative', borderRadius: '12px', overflow: 'hidden', backgroundColor: '#111' }}
+                        onTouchStart={onTouchStart}
+                        onTouchMove={onTouchMove}
+                        onTouchEnd={onTouchEnd}
+                    >
+                        {isPromo && (
+                            <div style={{ position: 'absolute', top: '15px', left: '15px', backgroundColor: 'var(--cor-destaque)', color: '#000', padding: '6px 12px', fontWeight: '900', borderRadius: '6px', zIndex: 10, fontSize: '0.9rem', boxShadow: '0 4px 10px rgba(0,0,0,0.5)' }}>
+                                {descontoPercentual}% OFF
+                            </div>
+                        )}
+
+                        <div style={{ position: 'absolute', top: '12px', right: '12px', zIndex: 20 }}>
+                            <WishlistButton product={product} variant="icon" size="md" />
+                        </div>
+
+                        {videoUrl && currentImageIndex === 0 && product.video ? (
+                            <video src={videoUrl} controls muted loop className="video-principal" />
+                        ) : (
+                            <div className="container-imagem-zoom" style={{ position: 'relative', width: '100%', aspectRatio: '1/1' }}>
+                                <Image
+                                    id="produto-imagem-principal"
+                                    src={currentMedia ? resolveOriginalUrl(currentMedia) : fallbackImage}
+                                    alt={product.nome}
+                                    fill
+                                    draggable={false}
+                                    style={{ objectFit: 'cover', cursor: 'zoom-in' }}
+                                    priority={true}
+                                    placeholder="blur"
+                                    blurDataURL={BLUR_DATA_URL}
+                                />
+                                <ImageZoom 
+                                    src={currentMedia ? resolveOriginalUrl(currentMedia) : fallbackImage}
+                                    alt={product.nome}
+                                    imageIndex={currentImageIndex}
+                                    productId={product.id}
+                                />
+                            </div>
+                        )}
+
+                        {mediaUrls.length > 1 && (
+                            <div style={{ display: 'flex', justifyContent: 'center', gap: '8px', marginTop: '15px', position: 'absolute', bottom: '15px', width: '100%' }}>
+                                {mediaUrls.map((_, idx) => (
+                                    <div 
+                                        key={idx} 
+                                        style={{
+                                            width: idx === currentImageIndex ? '20px' : '8px',
+                                            height: '8px',
+                                            borderRadius: '4px',
+                                            backgroundColor: idx === currentImageIndex ? 'var(--cor-destaque)' : 'rgba(255,255,255,0.5)',
+                                            transition: 'all 0.3s ease',
+                                            cursor: 'pointer',
+                                            boxShadow: '0 2px 4px rgba(0,0,0,0.8)'
+                                        }}
+                                        onClick={() => setCurrentImageIndex(idx)}
+                                    />
+                                ))}
+                            </div>
+                        )}
+                    </div>
+
+                    <div className="produto-miniaturas" style={{ marginTop: '20px' }}>
+                        {mediaUrls.map((url, idx) => (
+                            <Image
+                                key={idx}
+                                src={resolveOriginalUrl(url)}
+                                className={`miniatura-img ${idx === currentImageIndex ? 'ativa' : ''}`}
+                                onClick={() => setCurrentImageIndex(idx)}
+                                alt={`Miniatura ${idx + 1}`}
+                                loading="lazy"
+                                width={100}
+                                height={100}
+                                style={{ borderRadius: '8px', border: idx === currentImageIndex ? '2px solid var(--cor-destaque)' : '2px solid transparent', objectFit: 'cover', cursor: 'pointer' }}
+                                placeholder="blur"
+                                blurDataURL={BLUR_DATA_URL}
+                            />
+                        ))}
+                    </div>
+
+                    <div className="produto-descricao-container desktop-only-description" style={{ marginTop: '24px', borderTop: '1px solid #333', paddingTop: '24px' }}>
+                        <h3 style={{ fontSize: '1.2rem', marginBottom: '12px', color: 'var(--cor-destaque)', fontFamily: 'var(--fonte-titulos)' }}>
+                            Detalhes do Equipamento
+                        </h3>
+
+                        <div style={{ color: '#bbb', lineHeight: '1.7', fontSize: '0.95rem' }}>
+                            {isLongDescription && !isDescExpanded ? (
+                                <>
+                                    <p>{product.descricao?.substring(0, MAX_DESC_LENGTH)}...</p>
+                                    <button 
+                                        onClick={() => setIsDescExpanded(true)}
+                                        style={{ background: 'none', border: 'none', color: 'var(--cor-destaque)', fontWeight: 'bold', cursor: 'pointer', padding: '10px 0', display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.95rem' }}
+                                    >
+                                        Ler descrição completa <ChevronDown size={16} />
+                                    </button>
+                                </>
+                            ) : (
+                                <>
+                                    <p style={{ whiteSpace: 'pre-wrap' }}>{product.descricao}</p>
+                                    {isLongDescription && (
+                                        <button 
+                                            onClick={() => setIsDescExpanded(false)}
+                                            style={{ background: 'none', border: 'none', color: '#888', fontWeight: 'bold', cursor: 'pointer', padding: '10px 0 0', display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.95rem' }}
+                                        >
+                                            Ocultar descrição <ChevronUp size={16} />
+                                        </button>
+                                    )}
+                                </>
+                            )}
+                        </div>
+                    </div>
+                </div>
+
+                <div className="produto-detalhe-coluna-info">
+                    <div className="titulo-desktop-container" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '15px' }}>
+                        <h1 style={{ fontFamily: 'var(--fonte-titulos)', fontSize: '2.5rem', lineHeight: '1.1', color: 'var(--cor-destaque)', margin: 0 }}>{product.nome}</h1>
+                        <button onClick={handleShare} className="btn-share" aria-label="Compartilhar" style={{ background: 'none', border: 'none', color: '#ccc', cursor: 'pointer', padding: '0 0 0 10px' }}>
+                            <Share2 size={24} />
+                        </button>
+                    </div>
+
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', alignItems: 'center', marginBottom: '18px' }}>
+                        {product.em_estoque ? (
+                            <p className="status-estoque-detalhe em-estoque" style={{ display: 'inline-block', padding: '6px 12px', borderRadius: '999px', fontSize: '0.85rem', fontWeight: 'bold', backgroundColor: 'rgba(40, 167, 69, 0.15)', color: '#4ade80', border: '1px solid rgba(40, 167, 69, 0.3)' }}>
+                                ✓ Pronta Entrega
+                            </p>
+                        ) : (
+                            <p className="status-estoque-detalhe fora-de-estoque" style={{ display: 'inline-block', padding: '6px 12px', borderRadius: '999px', fontSize: '0.85rem', fontWeight: 'bold', backgroundColor: 'rgba(220, 53, 69, 0.15)', color: '#f87171', border: '1px solid rgba(220, 53, 69, 0.3)' }}>
+                                ✕ Fora de Estoque
+                            </p>
+                        )}
+                        <SavingsBadge originalPrice={product.preco} promotionalPrice={product.preco_promocional} />
+                    </div>
+
+                    <div className="produto-detalhe-preco" style={{ margin: '10px 0 25px 0' }}>
+                        {isPromo ? (
+                            <div style={{ display: 'flex', flexDirection: 'column' }}>
+                                <span className="preco-antigo" style={{ fontSize: '1.1rem', color: '#888', textDecoration: 'line-through' }}>
+                                    De R$ {product.preco.toFixed(2).replace('.', ',')}
+                                </span>
+                                <span className="preco-novo" style={{ fontSize: '2.5rem', fontWeight: '900', color: '#fff' }}>
+                                    R$ {displayedPrice.toFixed(2).replace('.', ',')}
+                                </span>
+                            </div>
+                        ) : (
+                            <span className="preco-normal" style={{ fontSize: '2.5rem', fontWeight: '900', color: '#fff' }}>
+                                R$ {displayedPrice.toFixed(2).replace('.', ',')}
+                            </span>
+                        )}
+                        {paymentMethod === 'PIX' && product.preco_pix && product.preco_pix > 0 ? (
+                            <p style={{ marginTop: '8px', color: '#fff', fontSize: '0.95rem', fontWeight: '700' }}>
+                                Preço PIX
+                            </p>
+                        ) : (
+                            <p style={{ marginTop: '8px', color: '#aaa', fontSize: '0.95rem' }}>
+                                Pagamento padrão
+                            </p>
+                        )}
+                        <PaymentMethods showLabel={true} compact={false} />
+                        <p style={{ fontSize: '0.9rem', color: '#aaa', marginTop: '5px' }}>💳 12x sem juros no cartão</p>
+                    </div>
+
+                    {variants && variants.opcoes && (
+                        <div className="produto-variantes" style={{ marginBottom: '25px', padding: '15px', backgroundColor: '#1a1a1a', borderRadius: '8px', border: '1px solid #333' }}>
+                            <label style={{ display: 'block', marginBottom: '8px', fontWeight: 'bold', color: '#eee' }}>
+                                Escolha {variants.tipo}:
+                            </label>
+                            <select
+                                className="select-variante"
+                                value={selectedVariant}
+                                onChange={(e) => setSelectedVariant(e.target.value)}
+                                style={{ width: '100%', padding: '14px', backgroundColor: '#222', color: 'white', border: '1px solid #444', borderRadius: '6px', fontSize: '1rem', outline: 'none', cursor: 'pointer' }}
+                            >
+                                <option value="" disabled>Selecione uma opção</option>
+                                {variants.opcoes.map((opt: string) => (
+                                    <option key={opt} value={opt}>{opt}</option>
+                                ))}
+                            </select>
+                        </div>
+                    )}
+
+                    <div className="produto-detalhe-botoes" style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
+                        {product.em_estoque ? (
+                            <button
+                                className="btn btn-adicionar"
+                                onClick={addToCart}
+                                style={{ padding: '18px', fontSize: '1.2rem', fontWeight: '900', borderRadius: '12px', textTransform: 'uppercase', letterSpacing: '1px', boxShadow: '0 10px 24px rgba(255, 107, 0, 0.18)', transition: 'transform 0.2s', border: '1px solid rgba(255,255,255,0.12)', background: 'linear-gradient(135deg, rgba(255,165,0,0.95), rgba(255,140,0,0.9))', color: '#111', backdropFilter: 'blur(10px)' }}
+                            >
+                                Adicionar ao Carrinho
+                            </button>
+                        ) : (
+                            <button
+                                className="btn btn-avise-me"
+                                onClick={() => window.open(`https://wa.me/5515998092548?text=Olá, gostaria de ser avisado quando o produto *${product.nome}* estiver disponível novamente.`, '_blank')}
+                                style={{ backgroundColor: '#444', color: 'white', width: '100%', padding: '18px', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 'bold', fontSize: '1.1rem' }}
+                            >
+                                Avise-me quando chegar
+                            </button>
+                        )}
+
+                        <button
+                            className="btn btn-secundario"
+                            onClick={() => setShowPurchaseModal(true)}
+                            disabled={!product.em_estoque}
+                            style={{ padding: '16px', fontSize: '1.05rem', background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.16)', color: '#fff', borderRadius: '12px', fontWeight: 'bold', display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '8px', backdropFilter: 'blur(10px)' }}
+                        >
+                            Comprar Rápido via WhatsApp
+                        </button>
+                    </div>
+
+                    <ShippingEstimator productId={product.id} />
+
+                    <div style={{ marginTop: '16px', padding: '14px 16px', borderRadius: '10px', background: 'linear-gradient(135deg, rgba(255, 107, 0, 0.12) 0%, rgba(255, 107, 0, 0.06) 100%)', border: '1px solid rgba(255, 107, 0, 0.25)' }}>
+                        <div style={{ fontWeight: 800, color: 'white', marginBottom: '6px' }}>Compra rápida e segura</div>
+                        <div style={{ color: '#ffd2ae', fontSize: '0.92rem', lineHeight: 1.6 }}>
+                            Envio rápido, pagamento confiável e atendimento direto no WhatsApp para você comprar com mais praticidade.
+                        </div>
+                    </div>
+
+                    <div className="produto-descricao-container mobile-only-description" style={{ marginTop: '20px', borderTop: '1px solid #333', paddingTop: '20px' }}>
+                        <h3 style={{ fontSize: '1.1rem', marginBottom: '10px', color: 'var(--cor-destaque)', fontFamily: 'var(--fonte-titulos)' }}>
+                            Detalhes do Equipamento
+                        </h3>
+
+                        <div style={{ color: '#bbb', lineHeight: '1.6', fontSize: '0.95rem' }}>
+                            {isLongDescription && !isDescExpanded ? (
+                                <>
+                                    <p>{product.descricao?.substring(0, MAX_DESC_LENGTH)}...</p>
+                                    <button 
+                                        onClick={() => setIsDescExpanded(true)}
+                                        style={{ background: 'none', border: 'none', color: 'var(--cor-destaque)', fontWeight: 'bold', cursor: 'pointer', padding: '10px 0', display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.95rem' }}
+                                    >
+                                        Ler descrição completa <ChevronDown size={16} />
+                                    </button>
+                                </>
+                            ) : (
+                                <>
+                                    <p style={{ whiteSpace: 'pre-wrap' }}>{product.descricao}</p>
+                                    {isLongDescription && (
+                                        <button 
+                                            onClick={() => setIsDescExpanded(false)}
+                                            style={{ background: 'none', border: 'none', color: '#888', fontWeight: 'bold', cursor: 'pointer', padding: '10px 0 0', display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.95rem' }}
+                                        >
+                                            Ocultar descrição <ChevronUp size={16} />
+                                        </button>
+                                    )}
+                                </>
+                            )}
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+
+            {relatedProducts.length > 0 && (
+                <section className="related-products-container" style={{ display: 'block', marginTop: '60px', borderTop: '1px solid #222', paddingTop: '40px' }}>
+                    <h2 className="related-title" style={{ fontFamily: 'var(--fonte-titulos)', fontSize: '2rem', marginBottom: '30px', color: 'var(--cor-destaque)' }}>Você também pode gostar</h2>
+                    <div className="related-list" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '20px' }}>
+                        {relatedProducts.map(rel => {
+                            const mediaUrl = rel.media_urls?.[0] || rel.imagens?.[0] || fallbackImage;
+                            const isVideo = mediaUrl.includes('.mp4') || mediaUrl.includes('.webm') || !!rel.video;
+                            const finalVideoUrl = rel.video || (isVideo ? mediaUrl : null);
+
+                            return (
+                                <Link key={rel.id} href={`/produto/${rel.slug || rel.id}`} className="related-product-card" style={{ backgroundColor: '#111', borderRadius: '12px', padding: '10px', textDecoration: 'none', border: '1px solid #222', transition: 'transform 0.2s' }}>
+                                    <div style={{ position: 'relative', width: '100%', aspectRatio: '1/1', borderRadius: '8px', overflow: 'hidden', marginBottom: '15px' }}>
+                                        {finalVideoUrl ? (
+                                            <video
+                                                src={finalVideoUrl}
+                                                style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                                                muted
+                                                loop
+                                                playsInline
+                                                onMouseOver={e => e.currentTarget.play()}
+                                                onMouseOut={e => e.currentTarget.pause()}
+                                            />
+                                        ) : (
+                                            <Image
+                                                src={resolveOriginalUrl(mediaUrl)}
+                                                alt={rel.nome}
+                                                fill
+                                                sizes="(max-width: 768px) 50vw, 25vw"
+                                                style={{ objectFit: 'cover' }}
+                                                placeholder="blur"
+                                                blurDataURL={BLUR_DATA_URL}
+                                            />
+                                        )}
+                                    </div>
+                                    <h4 style={{ fontSize: '0.95rem', margin: '0 0 10px 0', color: '#eee', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{rel.nome}</h4>
+                                    <p style={{ color: 'var(--cor-destaque)', fontWeight: 'bold', fontSize: '1.1rem', margin: 0 }}>R$ {(rel.preco_promocional || rel.preco).toFixed(2).replace('.', ',')}</p>
+                                </Link>
+                            );
+                        })}
+                    </div>
+                </section>
+            )}
+
+            <RecentlyViewed currentProductId={product?.id} limit={5} />
+
+            {showPurchaseModal && product && (
+                <DirectPurchaseModal
+                    isOpen={showPurchaseModal}
+                    onClose={() => setShowPurchaseModal(false)}
+                    product={product}
+                    initialVariant={variants && selectedVariant ? { tipo: variants.tipo, opcao: selectedVariant } : null}
+                />
+            )}
+
+            {product && <StickyCTA product={product} />}
+
+            <style dangerouslySetInnerHTML={{__html: `
+                @media (max-width: 768px) {
+                    .titulo-mobile-container {
+                        display: flex !important;
+                        margin-top: 20px !important;
+                    }
+                    .titulo-desktop-container {
+                        display: none !important;
+                    }
+                    .produto-detalhe-grid {
+                        grid-template-columns: 1fr !important;
+                        gap: 20px !important;
+                    }
+                    .produto-detalhe-coluna-info {
+                        padding-top: 0 !important;
+                    }
+                    .desktop-only-description {
+                        display: none !important;
+                    }
+                    .mobile-only-description {
+                        display: block !important;
+                    }
+                }
+
+                @media (min-width: 769px) {
+                    .mobile-only-description {
+                        display: none !important;
+                    }
+                }
+            `}} />
+        </div>
+    );
+}

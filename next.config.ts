@@ -1,0 +1,128 @@
+import type { NextConfig } from "next";
+
+const isDevelopment = process.env.NODE_ENV !== "production";
+const cspValue = isDevelopment
+  ? "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://www.googletagmanager.com https://analytics.ahrefs.com https://www.clarity.ms https://c.clarity.ms https://scripts.clarity.ms; object-src 'none'; frame-ancestors 'none'; upgrade-insecure-requests;"
+  : "script-src 'self' 'unsafe-inline' https://www.googletagmanager.com https://analytics.ahrefs.com https://www.clarity.ms https://c.clarity.ms https://scripts.clarity.ms; object-src 'none'; frame-ancestors 'none'; upgrade-insecure-requests;";
+const r2RemotePattern = (() => {
+  const publicUrl = process.env.NEXT_PUBLIC_R2_PUBLIC_URL;
+  if (!publicUrl) return null;
+
+  try {
+    const url = new URL(publicUrl);
+    if (url.protocol !== 'https:') return null;
+    const basePath = url.pathname.replace(/\/+$/, '');
+    return {
+      protocol: 'https' as const,
+      hostname: url.hostname,
+      port: url.port,
+      pathname: `${basePath}/**`,
+    };
+  } catch {
+    return null;
+  }
+})();
+
+const nextConfig: NextConfig = {
+  trailingSlash: false,
+
+  compiler: {
+    removeConsole: !isDevelopment,
+    reactRemoveProperties: !isDevelopment,
+  },
+  
+  experimental: {
+    serverActions: {
+      allowedOrigins: [
+        'probable-trout-979jr97rr7q53x7qx-3000.app.github.dev',
+        '*.app.github.dev',
+        'localhost:3000',
+        'gringastylebr.com.br',
+        'www.gringastylebr.com.br',
+      ],
+    },
+    optimizePackageImports: ['lucide-react', 'framer-motion'],
+  },
+
+  images: {
+    formats: ['image/avif', 'image/webp'],
+    minimumCacheTTL: 31536000,
+    deviceSizes: [320, 428, 540, 640, 750, 828, 1080, 1200, 1920],
+    imageSizes: [16, 32, 48, 64, 96, 128, 256, 384],
+    remotePatterns: [
+      ...(r2RemotePattern ? [r2RemotePattern] : []),
+      {
+        protocol: 'https',
+        hostname: 'pub-564d2f4b7a4d46f0a354513cc782519c.r2.dev',
+        port: '',
+        pathname: '/**',
+      },
+      {
+        protocol: 'https',
+        hostname: '**.supabase.co',
+        port: '',
+        pathname: '/**',
+      },
+      {
+        protocol: 'https',
+        hostname: 'res.cloudinary.com',
+        port: '',
+        pathname: '/**',
+      },
+    ],
+  },
+
+  async rewrites() {
+    const supabaseUrl = (process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://evgabdhvekmdhfvzteow.supabase.co').replace(/\/+$/, '');
+    return [
+      {
+        source: '/supabase-assets/:path*',
+        destination: `${supabaseUrl}/storage/v1/object/public/:path*`,
+      },
+    ];
+  },
+
+  async redirects() {
+    return [];
+  },
+
+  async headers() {
+    return [
+      {
+        source: '/(.*)',
+        headers: [
+          {
+            key: 'X-DNS-Prefetch-Control',
+            value: 'on',
+          },
+          {
+            key: 'Strict-Transport-Security',
+            value: 'max-age=63072000; includeSubDomains; preload',
+          },
+          {
+            key: 'X-Frame-Options',
+            value: 'DENY',
+          },
+          {
+            key: 'X-Content-Type-Options',
+            value: 'nosniff',
+          },
+          {
+            key: 'Referrer-Policy',
+            value: 'origin-when-cross-origin',
+          },
+          {
+            key: 'Content-Security-Policy',
+            value: cspValue,
+          },
+          {
+            key: 'Cross-Origin-Opener-Policy',
+            value: 'same-origin-allow-popups',
+          },
+        ],
+      },
+    ];
+  },
+};
+
+export default nextConfig;

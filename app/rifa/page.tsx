@@ -1,0 +1,476 @@
+'use client';
+import { useState, useEffect, useCallback } from 'react';
+import { supabase } from '@/lib/supabase';
+import { Rifa } from '@/types';
+import Link from 'next/link';
+import Image from 'next/image';
+import { useRouter } from 'next/navigation';
+import { useToast } from '@/context/ToastContext';
+import { reservarNumerosRifa } from '@/app/actions/rifa';
+import { Trophy } from 'lucide-react';
+import { getProxiedImageUrl } from '@/utils/imageUrl';
+import { FAQSchema, BreadcrumbSchema } from '@/components/SEO/StructuredData';
+import { motion } from 'framer-motion';
+
+// GROWTH HACK TÉCNICO: Forçamos o TypeScript a aceitar a nova coluna do banco
+// sem precisarmos reescrever os arquivos globais de tipagem agora.
+interface RifaFront extends Omit<Rifa, 'status'> {
+    status: 'ativa' | 'finalizada' | 'cancelada' | string;
+}
+
+export default function RifaPage() {
+    const { showToast } = useToast();
+    const [rifa, setRifa] = useState<RifaFront | null>(null);
+    const [winner, setWinner] = useState<{ vencedor_numero: number | null; vencedor_nome: string; vencedor_telefone: string } | null>(null);
+    const [loading, setLoading] = useState(true);
+    const [selectedNumbers, setSelectedNumbers] = useState<number[]>([]);
+    const [clientName, setClientName] = useState('');
+    const [clientPhone, setClientPhone] = useState('');
+    const [reserving, setReserving] = useState(false);
+    const [searchTerm, setSearchTerm] = useState('');
+    const [focusedInput, setFocusedInput] = useState<string | null>(null);
+    const router = useRouter();
+
+    const fetchRifa = useCallback(async (showLoadingState = true): Promise<RifaFront | null> => {
+        if (showLoadingState) setLoading(true);
+        let fetchedRifa: RifaFront | null = null;
+        try {
+            let { data: rifaData } = await supabase
+                .from('rifas')
+                .select('*')
+                .eq('status', 'ativa')
+                .order('created_at', { ascending: false })
+                .limit(1)
+                .maybeSingle();
+
+            if (!rifaData) {
+                const { data: lastRifa } = await supabase
+                    .from('rifas')
+                    .select('*')
+                    .eq('status', 'finalizada')
+                    .order('created_at', { ascending: false })
+                    .limit(1)
+                    .maybeSingle();
+
+                rifaData = lastRifa;
+            }
+
+            if (rifaData) {
+                fetchedRifa = rifaData as RifaFront;
+                setRifa(fetchedRifa);
+
+                setSelectedNumbers(current => {
+                    const sold = new Set(rifaData.numeros_vendidos || []);
+                    const reserved = new Set(rifaData.numeros_reservados || []);
+                    return current.filter(n => !sold.has(n) && !reserved.has(n));
+                });
+
+                if (rifaData.status === 'finalizada') {
+                    const response = await fetch(`/api/rifas/winner?id=${rifaData.id}`);
+                    const result = await response.json();
+                    if (!response.ok) throw new Error(result.error || 'Erro ao carregar o resultado.');
+                    setWinner(result.winners?.find((item: { vencedor_numero: number }) => item.vencedor_numero === rifaData.numero_vencedor) || null);
+                } else {
+                    setWinner(null);
+                }
+            } else {
+                setRifa(null);
+            }
+        } catch (error) {
+            console.error('Erro ao buscar rifa:', error);
+            if (showLoadingState) showToast('Erro ao carregar a rifa. Tente recarregar a página.', 'error');
+        } finally {
+            if (showLoadingState) setLoading(false);
+        }
+        return fetchedRifa;
+    }, [showToast]);
+
+    useEffect(() => {
+        let channel: ReturnType<typeof supabase.channel>;
+
+        // Busca inicial
+        fetchRifa(true);
+
+        // 1. Fallback de segurança: atualiza a cada 30 segundos
+        const pollInterval = setInterval(() => { fetchRifa(false); }, 30000);
+
+        // 2. Assinatura do Supabase Realtime
+        const setupRealtime = async () => {
+            channel = supabase
+                .channel('schema-db-changes')
+                .on(
+                    'postgres_changes',
+                    { event: '*', schema: 'public', table: 'rifas' },
+                    (payload) => {
+                        console.log('Alteração na Rifa detectada em tempo real!', payload);
+                        fetchRifa(false);
+                    }
+                )
+                .subscribe((status) => {
+                    console.log('Status de conexão do Supabase Realtime:', status);
+                });
+        };
+
+        setupRealtime();
+
+        return () => {
+            clearInterval(pollInterval);
+            if (channel) {
+                supabase.removeChannel(channel);
+            }
+        };
+    }, [fetchRifa]);
+
+    const toggleNumber = (number: number) => {
+        if (rifa?.status === 'finalizada') {
+            showToast('Esta rifa já foi encerrada.', 'error');
+            return;
+        }
+
+        let newSelection = [];
+        if (selectedNumbers.includes(number)) {
+            newSelection = selectedNumbers.filter(n => n !== number);
+        } else {
+            newSelection = [...selectedNumbers, number];
+        }
+        setSelectedNumbers(newSelection);
+    };
+
+    const handleSurpresinha = () => {
+        if (!rifa || rifa.status === 'finalizada') return;
+        const available = [];
+        const soldSet = new Set(rifa.numeros_vendidos || []);
+        const reservedSet = new Set(rifa.numeros_reservados || []);
+
+        for (let i = 0; i < rifa.total_numeros; i++) {
+            if (!soldSet.has(i) && !reservedSet.has(i) && !selectedNumbers.includes(i)) {
+                available.push(i);
+            }
+        }
+
+        if (available.length === 0) {
+            showToast('Não há números suficientes disponíveis.', 'error');
+            return;
+        }
+
+        const count = Math.min(5, available.length);
+        const randomSelection = [];
+        for (let i = 0; i < count; i++) {
+            const randomIndex = Math.floor(Math.random() * available.length);
+            randomSelection.push(available[randomIndex]);
+            available.splice(randomIndex, 1);
+        }
+
+        setSelectedNumbers([...selectedNumbers, ...randomSelection]);
+        showToast(`${count} números aleatórios selecionados!`, 'success');
+    };
+
+    const handleReserve = async () => {
+        if (!rifa || rifa.status === 'finalizada') return;
+        if (!clientName.trim() || !clientPhone.trim() || selectedNumbers.length === 0) {
+            showToast('Por favor, preencha seu nome, telefone e selecione pelo menos um número.', 'error');
+            return;
+        }
+
+        setReserving(true);
+        try {
+            const freshRifa = await fetchRifa(false);
+            if (!freshRifa) throw new Error('Não foi possível verificar a disponibilidade. Tente novamente.');
+
+            const soldSet = new Set(freshRifa.numeros_vendidos || []);
+            const reservedSet = new Set(freshRifa.numeros_reservados || []);
+            const conflitos = selectedNumbers.filter(n => soldSet.has(n) || reservedSet.has(n));
+
+            if (conflitos.length > 0) {
+                throw new Error("Um dos números que você escolheu acabou de ser reservado por outra pessoa. Atualizamos a lista.");
+            }
+
+            const result = await reservarNumerosRifa(freshRifa.id, selectedNumbers, clientName, clientPhone);
+
+            if (!result.success) throw new Error(result.error);
+            
+            let participantId = null;
+            if (Array.isArray(result.data) && result.data.length > 0) {
+                participantId = result.data[0].participante_id || result.data[0].id || (typeof result.data[0] === 'number' ? result.data[0] : null);
+            } else if (result.data && typeof result.data === 'object') {
+                participantId = result.data.participante_id || result.data.id;
+            } else if (typeof result.data === 'number' || typeof result.data === 'string') {
+                participantId = result.data;
+            }
+
+            if (!participantId) {
+                console.error("Erro Crítico: ID do Participante Ausente. Data completa:", result.data);
+                throw new Error(`Ocorreu um erro ao obter sua reserva. Dados: ${JSON.stringify(result.data)}. Por favor contate o suporte.`);
+            }
+
+            if (!result.paymentToken) throw new Error('Não foi possível gerar o acesso seguro ao pagamento. Contate o suporte.');
+            let paymentHash = '';
+            try {
+                sessionStorage.setItem(`payment-access-${participantId}`, result.paymentToken);
+            } catch {
+                paymentHash = `#payment_access=${encodeURIComponent(result.paymentToken)}`;
+            }
+            router.push(`/pagamento?participante_id=${participantId}${paymentHash}`);
+        } catch (error: any) {
+            const errorMessage = error instanceof Error ? error.message : 'Erro ao reservar. Tente novamente.';
+            showToast(errorMessage, 'error');
+            await fetchRifa(false);
+            setSelectedNumbers([]);
+        } finally {
+            setReserving(false);
+        }
+    };
+
+    if (loading) return (
+        <div className="container" id="rifa-container">
+            <div className="rifa-card">
+                {[{ w: '70%', h: '40px' }, { w: '100%', h: '400px' }, { w: '50%', h: '24px' }, { w: '100%', h: '20px' }, { w: '100%', h: '20px' }].map((s, i) => (
+                    <div key={i} style={{ background: '#333', borderRadius: '8px', height: s.h, width: s.w, marginBottom: '16px', animation: 'pulse 1.5s infinite ease-in-out' }} />
+                ))}
+            </div>
+            <style>{`@keyframes pulse { 0%,100%{opacity:.6} 50%{opacity:.25} }`}</style>
+        </div>
+    );
+
+    const rifaFaq = (
+        <>
+            <FAQSchema questions={[
+                {
+                    q: "Sobre a Transparência do Sorteio",
+                    a: "Nossos sorteios são realizados com total transparência assim que 100% das cotas forem vendidas e pagas. O resultado é sempre baseado nos números da Loteria Federal (geralmente os últimos dígitos do 1º prêmio). Isso garante que o sorteio é imune a qualquer tipo de fraude ou manipulação por parte da Gringa Style."
+                },
+                {
+                    q: "Datas e Prazos",
+                    a: "A data exata do sorteio é marcada e comunicada em nossos grupos de WhatsApp e Instagram (@gringastyle_br) logo após a venda da última cota. Assim que você reservar seu número, é fundamental enviar o comprovante de pagamento via WhatsApp no prazo estipulado (geralmente 24 horas), caso contrário, o número voltará a ficar disponível para o público."
+                },
+                {
+                    q: "Como recebo meu prêmio?",
+                    a: "Se você for o ganhador, nossa equipe entrará em contato imediatamente pelo WhatsApp cadastrado na hora da reserva. O envio do equipamento de solda TIG (máscara, tocha ou acessórios) é feito via transportadora ou Correios, totalmente documentado, e entregue direto na sua casa em qualquer lugar do Brasil."
+                }
+            ]} />
+            <div className="rifa-faq" style={{ marginTop: '50px', background: '#111', padding: '35px', borderRadius: '12px', border: '1px solid #27272a', textAlign: 'left' }}>
+                <h2 style={{ fontSize: '1.8rem', marginBottom: '25px', color: 'white', borderBottom: '2px solid var(--cor-destaque)', paddingBottom: '12px', display: 'inline-block' }}>Como funciona a Rifa Gringa Style? (Transparência e Regras)</h2>
+                
+                <details style={{ marginBottom: '20px', borderBottom: '1px solid #27272a', paddingBottom: '15px' }}>
+                    <summary style={{ color: 'var(--cor-destaque)', fontWeight: 'bold', fontSize: '1.2rem', cursor: 'pointer', listStyle: 'none', display: 'flex', alignItems: 'center' }}>
+                        <span style={{ marginRight: '10px' }}>›</span> Sobre a Transparência do Sorteio
+                    </summary>
+                    <p style={{ color: '#ccc', lineHeight: '1.7', marginTop: '12px', paddingLeft: '20px' }}>Nossos sorteios são realizados com total transparência assim que 100% das cotas forem vendidas e pagas. O resultado é sempre baseado nos números da Loteria Federal (geralmente os últimos dígitos do 1º prêmio). Isso garante que o sorteio é imune a qualquer tipo de fraude ou manipulação por parte da Gringa Style.</p>
+                </details>
+
+                <details style={{ marginBottom: '20px', borderBottom: '1px solid #27272a', paddingBottom: '15px' }}>
+                    <summary style={{ color: 'var(--cor-destaque)', fontWeight: 'bold', fontSize: '1.2rem', cursor: 'pointer', listStyle: 'none', display: 'flex', alignItems: 'center' }}>
+                        <span style={{ marginRight: '10px' }}>›</span> Datas e Prazos
+                    </summary>
+                    <p style={{ color: '#ccc', lineHeight: '1.7', marginTop: '12px', paddingLeft: '20px' }}>A data exata do sorteio é marcada e comunicada em nossos grupos de WhatsApp e Instagram (<strong>@gringastyle_br</strong>) logo após a venda da última cota. Assim que você reservar seu número, é fundamental enviar o comprovante de pagamento via WhatsApp no prazo estipulado (geralmente 24 horas), caso contrário, o número voltará a ficar disponível para o público.</p>
+                </details>
+
+                <details style={{ paddingBottom: '5px' }}>
+                    <summary style={{ color: 'var(--cor-destaque)', fontWeight: 'bold', fontSize: '1.2rem', cursor: 'pointer', listStyle: 'none', display: 'flex', alignItems: 'center' }}>
+                        <span style={{ marginRight: '10px' }}>›</span> Como recebo meu prêmio?
+                    </summary>
+                    <p style={{ color: '#ccc', lineHeight: '1.7', marginTop: '12px', paddingLeft: '20px' }}>Se você for o ganhador, nossa equipe entrará em contato imediatamente pelo WhatsApp cadastrado na hora da reserva. O envio do equipamento de solda TIG (máscara, tocha ou acessórios) é feito via transportadora ou Correios, totalmente documentado, e entregue direto na sua casa em qualquer lugar do Brasil.</p>
+                </details>
+            </div>
+        </>
+    );
+
+    if (!rifa) {
+        return (
+            <div className="container" id="rifa-container" style={{ textAlign: 'center', padding: '50px 0' }}>
+                <div className="rifa-card" style={{ marginBottom: '40px' }}>
+                    <h1 className="titulo-secao">Nenhuma Rifa no Momento</h1>
+                    <p style={{ fontSize: '1.1em' }}>Em breve teremos novidades.</p>
+                </div>
+                {rifaFaq}
+            </div>
+        );
+    }
+
+    const totalDigitos = String(rifa.total_numeros - 1).length;
+    const soldSet = new Set(rifa.numeros_vendidos || []);
+    const reservedSet = new Set(rifa.numeros_reservados || []);
+
+    const isFinished = rifa.status === 'finalizada';
+    const isSoldOut = soldSet.size >= rifa.total_numeros || isFinished;
+
+    const selectedCount = selectedNumbers.length;
+    const hasDiscountTier = Boolean(rifa.preco_numero_desconto_quantidade && rifa.preco_numero_desconto && rifa.preco_numero_desconto_quantidade > 0);
+    const discountThreshold = rifa.preco_numero_desconto_quantidade || 0;
+    const discountPrice = rifa.preco_numero_desconto ?? rifa.preco_numero;
+    const currentUnitPrice = hasDiscountTier && selectedCount >= discountThreshold
+        ? discountPrice
+        : rifa.preco_numero;
+    const totalPrice = selectedCount * currentUnitPrice;
+
+    // Tratamento seguro da URL da imagem garantindo fallback para o Cloudflare/Local caso venha vazia
+    const rawImage = rifa.imagem_premio_url?.trim() ? rifa.imagem_premio_url : '/imagens/gringa_style_logo.png';
+    const imageUrl = getProxiedImageUrl(rawImage);
+
+    const premioVencedor = winner;
+
+    return (
+        <>
+            <BreadcrumbSchema items={[
+                { name: 'Gringa Style', url: '/' },
+                { name: 'Rifa', url: '/rifa' }
+            ]} />
+            <div className="container" id="rifa-container">
+            <div className="rifa-card">
+                <h1 className="titulo-secao">{rifa.nome_premio}</h1>
+
+                <div className="relative w-full max-w-[600px] h-auto aspect-square mx-auto mb-6 rounded-xl overflow-hidden border border-zinc-800 bg-zinc-900 shadow-lg">
+                    <Image 
+                        src={imageUrl} 
+                        alt={rifa.nome_premio || 'Prêmio da Rifa'} 
+                        fill 
+                        priority 
+                        sizes="(max-width: 768px) 100vw, 600px" 
+                        className="object-cover" 
+                    />
+                </div>
+
+                {isFinished && (
+                    <motion.div 
+                        initial={{ opacity: 0, scale: 0.9 }}
+                        animate={{ opacity: 1, scale: 1 }}
+                        style={{ background: 'rgba(255, 165, 0, 0.1)', border: '2px solid orange', padding: '20px', borderRadius: '10px', marginBottom: '20px', textAlign: 'center' }}>
+                        <Trophy size={48} color="orange" style={{ margin: '0 auto 10px' }} />
+                        <h2 style={{ color: 'orange', margin: 0 }}>RIFA ENCERRADA</h2>
+                        {rifa.numero_vencedor !== null && rifa.numero_vencedor !== undefined ? (
+                            <div style={{ background: '#222', padding: '15px', borderRadius: '8px', marginTop: '15px' }}>
+                                <p style={{ fontSize: '1.2rem', color: 'white', marginBottom: '10px' }}>
+                                    O Número Vencedor foi: <br/><strong style={{ fontSize: '2.5rem', color: '#00ff88', letterSpacing: '2px' }}>{String(rifa.numero_vencedor).padStart(totalDigitos, '0')}</strong>
+                                </p>
+                                {premioVencedor && (
+                                    <>
+                                        <p style={{ color: '#ccc', margin: '5px 0', fontSize: '1.1rem' }}>🏆 Ganhador: <strong style={{color: 'white'}}>{premioVencedor.vencedor_nome}</strong></p>
+                                        <p style={{ color: '#ccc', margin: '5px 0', fontSize: '1.1rem' }}>📱 Contato: <strong style={{color: 'white'}}>{premioVencedor.vencedor_telefone}</strong></p>
+                                    </>
+                                )}
+                            </div>
+                        ) : (
+                            <p style={{ color: 'white', marginTop: '10px' }}>Sorteio realizado. Verifique os prêmios abaixo.</p>
+                        )}
+                        <Link href="/historico" style={{ display: 'inline-block', marginTop: '15px', color: 'orange', textDecoration: 'underline' }}>
+                            Ver Histórico Completo
+                        </Link>
+                    </motion.div>
+                )}
+
+                <p className="rifa-descricao">{rifa.descricao}</p>
+
+                {!isFinished && (
+                    <p className="rifa-preco">Apenas R$ {rifa.preco_numero.toFixed(2).replace('.', ',')} por número!</p>
+                )}
+
+                <Link href={`/acompanhar-rifa?id=${rifa.id}`} className="btn btn-secundario" style={{ marginBottom: '20px', display: 'inline-block' }}>
+                    Ver Participantes
+                </Link>
+
+                <div className="rifa-progresso-container" style={{ margin: '20px 0', textAlign: 'left' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '5px' }}>
+                        <span>Progresso:</span>
+                        <span>{Math.round((soldSet.size / rifa.total_numeros) * 100)}% vendido</span>
+                    </div>
+                    <div style={{ width: '100%', height: '20px', backgroundColor: '#333', borderRadius: '10px', overflow: 'hidden' }}>
+                        <div style={{ width: `${(soldSet.size / rifa.total_numeros) * 100}%`, height: '100%', backgroundColor: 'var(--cor-destaque)', transition: 'width 0.5s ease-in-out' }} />
+                    </div>
+                </div>
+
+                {isFinished ? (
+                    <div className="aviso-esgotado" style={{ background: '#333', color: '#aaa', padding: '15px', borderRadius: '8px', fontWeight: 'bold' }}>
+                        Esta rifa já foi sorteada e encerrada. Obrigado por participar!
+                    </div>
+                ) : isSoldOut ? (
+                    <div className="aviso-esgotado" style={{ background: '#ff4444', color: 'white', padding: '15px', borderRadius: '8px', fontWeight: 'bold' }}>
+                        RIFA ESGOTADA! O sorteio será realizado em breve!
+                    </div>
+                ) : (
+                    <div className="rifa-actions-container" style={{ marginBottom: '20px' }}>
+                        <h3>Escolha seus números da sorte:</h3>
+                        <div className="rifa-controls" style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', justifyContent: 'center', marginBottom: '15px' }}>
+                            <input type="number" placeholder="Buscar número..." className="input-busca-rifa" value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} style={{ padding: '10px', borderRadius: '5px', border: '1px solid #444', background: '#222', color: 'white' }} />
+                            <button className="btn btn-surpresinha" onClick={handleSurpresinha} style={{ background: 'var(--cor-destaque)', color: 'black', border: 'none', padding: '10px 15px', borderRadius: '5px', fontWeight: 'bold', cursor: 'pointer' }}>
+                                🎲 Surpresinha (5)
+                            </button>
+                        </div>
+                    </div>
+                )}
+
+                <div className={`numeros-grid ${isSoldOut ? 'desabilitado' : ''}`}>
+                    {Array.from({ length: rifa.total_numeros }).map((_, i) => {
+                        const numStr = String(i).padStart(totalDigitos, '0');
+                        if (searchTerm && !numStr.includes(searchTerm)) return null;
+
+                        const isOccupied = soldSet.has(i) || reservedSet.has(i);
+                        const isSelected = selectedNumbers.includes(i);
+
+                        return (
+                            <div
+                                key={i}
+                                className={`numero-rifa ${isOccupied ? 'ocupado' : ''} ${isSelected ? 'selecionado' : ''}`}
+                                onClick={() => !isOccupied && !isFinished && !isSoldOut && toggleNumber(i)}
+                                style={{ opacity: isFinished ? 0.5 : 1, cursor: isFinished || isOccupied ? 'not-allowed' : 'pointer' }}
+                            >
+                                {numStr}
+                            </div>
+                        );
+                    })}
+                </div>
+
+                {!isSoldOut && !isFinished && selectedNumbers.length > 0 && (
+                    <div className="resumo-selecao" style={{ display: 'block' }}>
+                        <h4>Resumo da sua Seleção</h4>
+                        <p>Preço por número: <strong>R$ {currentUnitPrice.toFixed(2).replace('.', ',')}</strong></p>
+                        {hasDiscountTier && selectedCount >= (rifa.preco_numero_desconto_quantidade || 0) && (
+                            <p style={{ color: 'var(--cor-destaque)', marginTop: '8px' }}>
+                                Desconto aplicado! Preço reduzido a R$ {rifa.preco_numero_desconto?.toFixed(2).replace('.', ',')} a partir de {rifa.preco_numero_desconto_quantidade} números.
+                            </p>
+                        )}
+                        <p>Total a pagar: <strong id="total-a-pagar">R$ {totalPrice.toFixed(2).replace('.', ',')}</strong></p>
+                        <div className="form-cliente">
+                            <motion.div
+                                animate={{ boxShadow: focusedInput === 'name' ? '0 0 10px rgba(255, 165, 0, 0.3)' : '0 0 0px rgba(255, 165, 0, 0)' }}
+                                transition={{ duration: 0.2 }}
+                                style={{ borderRadius: '5px' }}
+                            >
+                                <input 
+                                    type="text" 
+                                    className="input-cliente" 
+                                    placeholder="Seu nome completo" 
+                                    value={clientName} 
+                                    onChange={(e) => setClientName(e.target.value)}
+                                    onFocus={() => setFocusedInput('name')}
+                                    onBlur={() => setFocusedInput(null)}
+                                    required 
+                                />
+                            </motion.div>
+                            <motion.div
+                                animate={{ boxShadow: focusedInput === 'phone' ? '0 0 10px rgba(255, 165, 0, 0.3)' : '0 0 0px rgba(255, 165, 0, 0)' }}
+                                transition={{ duration: 0.2 }}
+                                style={{ borderRadius: '5px' }}
+                            >
+                                <input 
+                                    type="tel" 
+                                    className="input-cliente" 
+                                    placeholder="Seu WhatsApp (DDD + Número)" 
+                                    value={clientPhone} 
+                                    onChange={(e) => setClientPhone(e.target.value)}
+                                    onFocus={() => setFocusedInput('phone')}
+                                    onBlur={() => setFocusedInput(null)}
+                                    required 
+                                />
+                            </motion.div>
+                            <button className="btn btn-finalizar" onClick={handleReserve} disabled={reserving}>
+                                {reserving ? 'Reservando...' : 'Reservar e Pagar'}
+                            </button>
+                        </div>
+                    </div>
+                )}
+            </div>
+            {rifaFaq}
+        </div>
+    </>
+    );
+}

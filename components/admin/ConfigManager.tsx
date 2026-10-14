@@ -1,0 +1,60 @@
+'use client';
+
+import { useState, useEffect } from 'react';
+import { supabase } from '@/lib/supabase';
+import { saveShopConfig } from '@/app/actions/admin-data';
+
+export default function ConfigManager() {
+    const [diasNovo, setDiasNovo] = useState('');
+    const [loading, setLoading] = useState(false);
+
+    useEffect(() => {
+        fetchConfig();
+    }, []);
+
+    const fetchConfig = async () => {
+        const { data } = await supabase.from('configuracoes').select('*').eq('chave', 'dias_novo').maybeSingle();
+        if (data) setDiasNovo(data.valor);
+    };
+
+    const handleSave = async () => {
+        if (!diasNovo) return;
+        setLoading(true);
+        try {
+            const parsedDays = Number(diasNovo);
+            const result = await saveShopConfig(parsedDays);
+            if (!result.success) throw new Error(result.error);
+            alert('Configurações salvas!');
+        } catch (error: any) {
+            alert('Erro ao salvar: ' + error.message);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    return (
+        <div className="admin-container">
+            <div className="admin-header">
+                <h1 className="titulo-secao" style={{ marginBottom: 0 }}>Configurações da Loja</h1>
+            </div>
+
+            <div className="admin-container" style={{ marginTop: '20px', background: '#222', padding: '20px', borderRadius: '8px' }}>
+                <div className="form-campo">
+                    <label>Dias de Destaque &quot;NOVO&quot;</label>
+                    <input
+                        type="number"
+                        value={diasNovo}
+                        onChange={(e) => setDiasNovo(e.target.value)}
+                        placeholder="Ex: 7"
+                        style={{ maxWidth: '150px' }}
+                    />
+                    <small>Produtos criados há menos de X dias receberão o selo &quot;NOVO&quot;.</small>
+                </div>
+
+                <button className="btn-admin btn-adicionar" onClick={handleSave} disabled={loading}>
+                    {loading ? 'Salvando...' : 'Salvar Configurações'}
+                </button>
+            </div>
+        </div>
+    );
+}
